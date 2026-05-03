@@ -16,9 +16,24 @@ Each push that touches kernels.py triggers the autograder, which runs
 on a Modal A100 40GB and posts your grade as a comment on the commit.
 You have 5 graded submissions per assignment.
 """
-import math
 
-from numba import cuda, float32
+import math
+import os
+import ctypes
+from numba import cuda, float32, config
+
+# 1. Force WSL Driver Path
+os.environ['LD_LIBRARY_PATH'] = '/usr/lib/wsl/lib'
+# 2. Point to the local toolkit for compilation
+os.environ['NUMBA_CUDA_PATH'] = '/usr/local/cuda'
+
+# 3. Pre-load the WSL driver to prevent 'undefined symbol' errors
+try:
+    ctypes.CDLL('/usr/lib/wsl/lib/libcuda.so.1')
+except:
+    pass
+# 4. Bypasses 'ERROR_INVALID_OPTION' on RTX 50-series
+config.CUDA_COMPUTE_CAPABILITY = (9, 0)
 
 
 # ── Tile constants ──────────────────────────────────────────────────
@@ -72,8 +87,14 @@ def sgemm_coalesced(A, B, C, M, N, K):
     and modulo by BLOCKSIZE. 
     Be careful which one indexes the column.
     """
-    # TODO
-    return
+    x = cuda.blockIdx.x * BLOCKSIZE + (cuda.threadIdx.x // BLOCKSIZE)
+    y = cuda.blockIdx.y * BLOCKSIZE + (cuda.threadIdx.x % BLOCKSIZE)
+
+    if x < M and y < N:
+        tmp = float32(0.0)
+        for i in range(K):
+            tmp += A[x, i] * B[i, y]
+        C[x, y] = tmp
 
 
 # ── K3: shared-memory cache-blocking (TODO) ─────────────────────────
@@ -97,8 +118,58 @@ def sgemm_smem(A, B, C, M, N, K):
     (BK3, BN3) for Bs.
     Use 0.0 in the SMEM load when the global index is out of bounds.
     """
-    # TODO
-    return
+    # create the shared arrays with right sizes
+    sA = cuda.shared.array((BM3, BK3), float32)
+    sB = cuda.shared.array((BK3, BN3), float32)
+
+    tid = cuda.threadIdx.x
+    
+    # define which tile the thread will put its answer in the output 
+    tx = tid % BN3
+    ty = tid // BN3
+    row = cuda.blockIdx.x * BM3 + ty
+    col = cuda.blockIdx.y * BN3 + tx
+
+    # thread loading indexes  
+    load_row_A = tid // BK3
+    load_col_A = tid % BK3
+    
+    load_row_B = tid // BN3
+    load_col_B = tid % BN3
+
+    tmp = float32(0.0)
+
+    for k_step in range(0, K, BK3):
+        # load A tile
+        a_row = cuda.blockIdx.x * BM3 + load_row_A
+        a_col = k_step + load_col_A
+
+        # check if the postion is out of range 
+        if a_row < M and a_col < K:
+            sA[load_row_A, load_col_A] = A[a_row, a_col]
+        else:
+            sA[load_row_A, load_col_A] = float32(0.0)
+
+        # load values for B tile
+        b_row = k_step + load_row_B
+        b_col = cuda.blockIdx.y * BN3 + load_col_B
+
+        if b_row < K and b_col < N:
+            sB[load_row_B, load_col_B] = B[b_row, b_col]
+        else:
+            sB[load_row_B, load_col_B] = float32(0.0)
+
+        cuda.syncthreads()
+
+        # calculte aTile * bTile add to accumulator 
+        for i in range(BK3):
+            tmp += sA[ty, i] * sB[i, tx]
+
+        cuda.syncthreads()
+
+    if row < M and col < N:
+        C[row, col] = tmp
+    
 
 
 # ── K4: 1D register tiling (TODO) ───────────────────────────────────
