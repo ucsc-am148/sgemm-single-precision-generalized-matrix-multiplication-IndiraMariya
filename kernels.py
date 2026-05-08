@@ -22,20 +22,6 @@ import os
 import ctypes
 from numba import cuda, float32, config
 
-# 1. Force WSL Driver Path
-os.environ['LD_LIBRARY_PATH'] = '/usr/lib/wsl/lib'
-# 2. Point to the local toolkit for compilation
-os.environ['NUMBA_CUDA_PATH'] = '/usr/local/cuda'
-
-# 3. Pre-load the WSL driver to prevent 'undefined symbol' errors
-try:
-    ctypes.CDLL('/usr/lib/wsl/lib/libcuda.so.1')
-except:
-    pass
-# 4. Bypasses 'ERROR_INVALID_OPTION' on RTX 50-series
-config.CUDA_COMPUTE_CAPABILITY = (9, 0)
-
-
 # ── Tile constants ──────────────────────────────────────────────────
 # These are tied to the launch shapes the autograder will use. Do not
 # change them; the run_kN wrappers below depend on these values.
@@ -121,7 +107,6 @@ def sgemm_smem(A, B, C, M, N, K):
     # create the shared arrays with right sizes
     sA = cuda.shared.array((BM3, BK3), float32)
     sB = cuda.shared.array((BK3, BN3), float32)
-
     tid = cuda.threadIdx.x
     
     # define which tile the thread will put its answer in the output 
@@ -133,17 +118,14 @@ def sgemm_smem(A, B, C, M, N, K):
     # thread loading indexes  
     load_row_A = tid // BK3
     load_col_A = tid % BK3
-    
     load_row_B = tid // BN3
     load_col_B = tid % BN3
-
     tmp = float32(0.0)
 
     for k_step in range(0, K, BK3):
         # load A tile
         a_row = cuda.blockIdx.x * BM3 + load_row_A
         a_col = k_step + load_col_A
-
         # check if the postion is out of range 
         if a_row < M and a_col < K:
             sA[load_row_A, load_col_A] = A[a_row, a_col]
@@ -153,18 +135,15 @@ def sgemm_smem(A, B, C, M, N, K):
         # load values for B tile
         b_row = k_step + load_row_B
         b_col = cuda.blockIdx.y * BN3 + load_col_B
-
         if b_row < K and b_col < N:
             sB[load_row_B, load_col_B] = B[b_row, b_col]
         else:
             sB[load_row_B, load_col_B] = float32(0.0)
 
         cuda.syncthreads()
-
         # calculte aTile * bTile add to accumulator 
         for i in range(BK3):
             tmp += sA[ty, i] * sB[i, tx]
-
         cuda.syncthreads()
 
     if row < M and col < N:
@@ -194,8 +173,58 @@ def sgemm_1d_tile(A, B, C, M, N, K):
     Use cuda.local.array(TM4, float32) for the per-thread accumulator array.
     Initialize all entries to 0.0 before the K-loop.
     """
-    # TODO
-    return
+    sA = cuda.shared.array((BM4, BK4), float32)
+    sB = cuda.shared.array((BK4, BN4), float32)
+
+    localacc = cuda.local.array(TM4, float32)
+    tid = cuda.threadIdx.x
+
+    # --- define position variables FIRST ---
+    tx = tid % BN4
+    ty = tid // BN4
+    block_row_start = cuda.blockIdx.y * BM4
+    block_col_start = cuda.blockIdx.x * BN4
+
+    # thread loading indexes
+    load_row_A = tid // BK4
+    load_col_A = tid % BK4
+    load_row_B = tid // BN4
+    load_col_B = tid % BN4
+
+    for i in range(TM4):
+        localacc[i] = float32(0.0)
+
+    for k_step in range(0, K, BK4):
+        # load A tile
+        a_row = block_row_start + load_row_A
+        a_col = k_step + load_col_A
+        if a_row < M and a_col < K:
+            sA[load_row_A, load_col_A] = A[a_row, a_col]
+        else:
+            sA[load_row_A, load_col_A] = float32(0.0)
+
+        # load B tile
+        b_row = k_step + load_row_B
+        b_col = block_col_start + load_col_B
+        if b_row < K and b_col < N:
+            sB[load_row_B, load_col_B] = B[b_row, b_col]
+        else:
+            sB[load_row_B, load_col_B] = float32(0.0)
+
+        cuda.syncthreads()
+
+        for i in range(BK4):
+            b_val = sB[i, tx]
+            for resIdx in range(TM4):
+                localacc[resIdx] += sA[ty * TM4 + resIdx, i] * b_val
+
+        cuda.syncthreads()
+
+    for resIdx in range(TM4):
+        out_row = block_row_start + ty * TM4 + resIdx
+        out_col = block_col_start + tx
+        if out_row < M and out_col < N:
+            C[out_row, out_col] = localacc[resIdx]
 
 
 # ── K5: 2D register tiling (TODO) ───────────────────────────────────
@@ -219,8 +248,87 @@ def sgemm_2d_tile(A, B, C, M, N, K):
     For accumulators, use cuda.local.array((TM5, TN5), float32).
     Numba supports tuple-shaped local arrays!
     """
-    # TODO
-    return
+    sA = cuda.shared.array((BM5, BK5), float32)
+    sB = cuda.shared.array((BK5, BN5), float32)
+
+    localacc = cuda.local.array((TM5, TN5), float32)
+    regA = cuda.local.array(TM5, float32)
+    regB = cuda.local.array(TN5, float32)
+
+    tid = cuda.threadIdx.x
+    num_threads = BM5 * BN5 // (TM5 * TN5)  # 256
+
+    # Which output tile does this thread own?
+    # Threads are arranged in a (BM5/TM5) x (BN5/TN5) grid = 16 x 16
+    tx = tid % (BN5 // TN5)   # thread col index within tile grid
+    ty = tid // (BN5 // TN5)  # thread row index within tile grid
+
+    block_row_start = cuda.blockIdx.y * BM5
+    block_col_start = cuda.blockIdx.x * BN5
+
+    # Strided load indices — each thread loads multiple elements per tile.
+    # Consecutive threads touch consecutive columns → coalesced GMEM access.
+    # A tile: BM5 x BK5 = 1024 elements, 256 threads → 4 elements each
+    # Stride threads across columns (inner dim), so tid % BK5 = column.
+    load_col_A = tid % BK5
+    load_row_A = tid // BK5          # starting row; stride by num_threads // BK5
+    A_row_stride = num_threads // BK5
+
+    load_col_B = tid % BN5
+    load_row_B = tid // BN5          # starting row; stride by num_threads // BN5
+    B_row_stride = num_threads // BN5
+
+    # clear the local accumulator
+    for i in range(TM5):
+        for j in range(TN5):
+            localacc[i, j] = float32(0.0)
+
+    for k_step in range(0, K, BK5):
+
+        # Shared load of A tile with stride loop
+        for s in range(BM5 // A_row_stride):
+            a_row = block_row_start + load_row_A + s * A_row_stride
+            a_col = k_step + load_col_A
+            r = load_row_A + s * A_row_stride
+            if a_row < M and a_col < K:
+                sA[r, load_col_A] = A[a_row, a_col]
+            else:
+                sA[r, load_col_A] = float32(0.0)
+
+        # Shared load of B tile with stride loop
+        for s in range(BK5 // B_row_stride):
+            b_row = k_step + load_row_B + s * B_row_stride
+            b_col = block_col_start + load_col_B
+            r = load_row_B + s * B_row_stride
+            if b_row < K and b_col < N:
+                sB[r, load_col_B] = B[b_row, b_col]
+            else:
+                sB[r, load_col_B] = float32(0.0)
+    
+        cuda.syncthreads()
+
+        # accumulate outer product into localacc
+        for i in range(BK5):
+            # cache TM5 A values into registers
+            for ti in range(TM5):
+                regA[ti] = sA[ty * TM5 + ti, i]
+            # cache TN5 B vals
+            for tj in range(TN5):
+                regB[tj] = sB[i, tx * TN5 + tj]
+            # update outer product into localacc
+            for ti in range(TM5):
+                for tj in range(TN5):
+                    localacc[ti, tj] += regA[ti] * regB[tj]
+
+        cuda.syncthreads()
+
+    # write to output tile from localacc
+    for ti in range(TM5):
+        for tj in range(TN5):
+            out_row = block_row_start + ty * TM5 + ti
+            out_col = block_col_start + tx * TN5 + tj
+            if out_row < M and out_col < N:
+                C[out_row, out_col] = localacc[ti, tj]
 
 
 # ── Launch wrappers (provided — do not edit) ────────────────────────
