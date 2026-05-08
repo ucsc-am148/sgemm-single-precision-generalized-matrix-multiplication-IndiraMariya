@@ -179,7 +179,7 @@ def sgemm_1d_tile(A, B, C, M, N, K):
     localacc = cuda.local.array(TM4, float32)
     tid = cuda.threadIdx.x
 
-    # --- define position variables FIRST ---
+    # define position vars
     tx = tid % BN4
     ty = tid // BN4
     block_row_start = cuda.blockIdx.y * BM4
@@ -250,32 +250,28 @@ def sgemm_2d_tile(A, B, C, M, N, K):
     """
     sA = cuda.shared.array((BM5, BK5), float32)
     sB = cuda.shared.array((BK5, BN5), float32)
-
+    
     localacc = cuda.local.array((TM5, TN5), float32)
-    regA = cuda.local.array(TM5, float32)
-    regB = cuda.local.array(TN5, float32)
+    
+    locA = cuda.local.array(TM5, float32)
+    locB = cuda.local.array(TN5, float32)
 
     tid = cuda.threadIdx.x
-    num_threads = BM5 * BN5 // (TM5 * TN5)  # 256
+    num_threads = BM5*BN5//(TM5*TN5)
 
-    # Which output tile does this thread own?
-    # Threads are arranged in a (BM5/TM5) x (BN5/TN5) grid = 16 x 16
-    tx = tid % (BN5 // TN5)   # thread col index within tile grid
-    ty = tid // (BN5 // TN5)  # thread row index within tile grid
+    thread_col = tid % (BN5 // TN5)   # thread col index in grid
+    thread_row = tid // (BN5 // TN5)  # thread row index in grid
 
-    block_row_start = cuda.blockIdx.y * BM5
-    block_col_start = cuda.blockIdx.x * BN5
+    b_row_start = cuda.blockIdx.y * BM5
+    b_col_start = cuda.blockIdx.x * BN5
 
-    # Strided load indices — each thread loads multiple elements per tile.
-    # Consecutive threads touch consecutive columns → coalesced GMEM access.
-    # A tile: BM5 x BK5 = 1024 elements, 256 threads → 4 elements each
-    # Stride threads across columns (inner dim), so tid % BK5 = column.
+    # Strided index load -> each thread loads multiple elements per tile
     load_col_A = tid % BK5
-    load_row_A = tid // BK5          # starting row; stride by num_threads // BK5
+    load_row_A = tid // BK5
     A_row_stride = num_threads // BK5
 
     load_col_B = tid % BN5
-    load_row_B = tid // BN5          # starting row; stride by num_threads // BN5
+    load_row_B = tid // BN5
     B_row_stride = num_threads // BN5
 
     # clear the local accumulator
@@ -287,7 +283,7 @@ def sgemm_2d_tile(A, B, C, M, N, K):
 
         # Shared load of A tile with stride loop
         for s in range(BM5 // A_row_stride):
-            a_row = block_row_start + load_row_A + s * A_row_stride
+            a_row = b_row_start + load_row_A + s * A_row_stride
             a_col = k_step + load_col_A
             r = load_row_A + s * A_row_stride
             if a_row < M and a_col < K:
@@ -298,7 +294,7 @@ def sgemm_2d_tile(A, B, C, M, N, K):
         # Shared load of B tile with stride loop
         for s in range(BK5 // B_row_stride):
             b_row = k_step + load_row_B + s * B_row_stride
-            b_col = block_col_start + load_col_B
+            b_col = b_col_start + load_col_B
             r = load_row_B + s * B_row_stride
             if b_row < K and b_col < N:
                 sB[r, load_col_B] = B[b_row, b_col]
@@ -309,24 +305,21 @@ def sgemm_2d_tile(A, B, C, M, N, K):
 
         # accumulate outer product into localacc
         for i in range(BK5):
-            # cache TM5 A values into registers
             for ti in range(TM5):
-                regA[ti] = sA[ty * TM5 + ti, i]
-            # cache TN5 B vals
+                locA[ti] = sA[thread_row * TM5 + ti, i]
             for tj in range(TN5):
-                regB[tj] = sB[i, tx * TN5 + tj]
-            # update outer product into localacc
+                locB[tj] = sB[i, thread_col * TN5 + tj]
             for ti in range(TM5):
                 for tj in range(TN5):
-                    localacc[ti, tj] += regA[ti] * regB[tj]
+                    localacc[ti, tj] += locA[ti] * locB[tj]
 
         cuda.syncthreads()
 
     # write to output tile from localacc
     for ti in range(TM5):
         for tj in range(TN5):
-            out_row = block_row_start + ty * TM5 + ti
-            out_col = block_col_start + tx * TN5 + tj
+            out_row = b_row_start + thread_row * TM5 + ti
+            out_col = b_col_start + thread_col * TN5 + tj
             if out_row < M and out_col < N:
                 C[out_row, out_col] = localacc[ti, tj]
 
